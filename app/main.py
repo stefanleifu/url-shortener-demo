@@ -10,18 +10,29 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from app.rate_limit import SlidingWindowRateLimiter
 from app.storage import DuplicateAliasError, LinkStore
 
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
 DEFAULT_DATABASE = "data/links.db"
+DEFAULT_CREATE_RATE_LIMIT_PER_MINUTE = 30
 ALIAS_PATTERN = re.compile(r"^[A-Za-z0-9_-]{3,32}$")
 RESERVED_PATHS = {"", "healthz", "urls", "stats"}
 
 
-def create_app(database_path: str | Path) -> type[BaseHTTPRequestHandler]:
+def create_app(
+    database_path: str | Path,
+    *,
+    create_rate_limit_per_minute: int = DEFAULT_CREATE_RATE_LIMIT_PER_MINUTE,
+    rate_limit_window_seconds: int = 60,
+) -> type[BaseHTTPRequestHandler]:
     store = LinkStore(database_path)
+    create_limiter = SlidingWindowRateLimiter(
+        limit=create_rate_limit_per_minute,
+        window_seconds=rate_limit_window_seconds,
+    )
 
     class UrlShortenerHandler(BaseHTTPRequestHandler):
         server_version = "UrlShortenerDemo/1.0"
@@ -48,6 +59,22 @@ def create_app(database_path: str | Path) -> type[BaseHTTPRequestHandler]:
 
             if path != "urls":
                 self._send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
+                return
+
+            rate_limit_result = create_limiter.check(self._client_key())
+            if not rate_limit_result.allowed:
+                self._send_json(
+                    {
+                        "error": "Rate limit exceeded",
+                        "retryAfterSeconds": rate_limit_result.retry_after_seconds,
+                    },
+                    HTTPStatus.TOO_MANY_REQUESTS,
+                    headers={
+                        "Retry-After": str(rate_limit_result.retry_after_seconds),
+                        "X-RateLimit-Limit": str(create_limiter.limit),
+                        "X-RateLimit-Remaining": "0",
+                    },
+                )
                 return
 
             payload = self._read_json()
@@ -127,6 +154,12 @@ def create_app(database_path: str | Path) -> type[BaseHTTPRequestHandler]:
             host = self.headers.get("Host", f"{DEFAULT_HOST}:{DEFAULT_PORT}")
             return f"http://{host}"
 
+        def _client_key(self) -> str:
+            forwarded_for = self.headers.get("X-Forwarded-For")
+            if forwarded_for:
+                return forwarded_for.split(",", 1)[0].strip()
+            return self.client_address[0]
+
         def _read_json(self) -> dict[str, Any] | None:
             try:
                 content_length = int(self.headers.get("Content-Length", "0"))
@@ -145,11 +178,15 @@ def create_app(database_path: str | Path) -> type[BaseHTTPRequestHandler]:
             self,
             payload: dict[str, Any],
             status: HTTPStatus = HTTPStatus.OK,
+            headers: dict[str, str] | None = None,
         ) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            if headers:
+                for key, value in headers.items():
+                    self.send_header(key, value)
             self.end_headers()
             self.wfile.write(body)
 
@@ -269,12 +306,21 @@ def validate_create_payload(
     return errors
 
 
-def run_server(host: str, port: int, database_path: str | Path) -> None:
+def run_server(
+    host: str,
+    port: int,
+    database_path: str | Path,
+    create_rate_limit_per_minute: int,
+) -> None:
     Path(database_path).parent.mkdir(parents=True, exist_ok=True)
-    handler = create_app(database_path)
+    handler = create_app(
+        database_path,
+        create_rate_limit_per_minute=create_rate_limit_per_minute,
+    )
     server = ThreadingHTTPServer((host, port), handler)
     print(f"URL shortener listening on http://{host}:{port}")
     print(f"SQLite database: {database_path}")
+    print(f"Create endpoint rate limit: {create_rate_limit_per_minute}/minute")
     server.serve_forever()
 
 
@@ -283,9 +329,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default=os.getenv("HOST", DEFAULT_HOST))
     parser.add_argument("--port", type=int, default=int(os.getenv("PORT", str(DEFAULT_PORT))))
     parser.add_argument("--database", default=os.getenv("DATABASE_URL", DEFAULT_DATABASE))
+    parser.add_argument(
+        "--create-rate-limit",
+        type=int,
+        default=int(os.getenv("CREATE_RATE_LIMIT_PER_MINUTE", str(DEFAULT_CREATE_RATE_LIMIT_PER_MINUTE))),
+        help="Maximum POST /urls requests per client per minute",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    run_server(args.host, args.port, args.database)
+    run_server(args.host, args.port, args.database, args.create_rate_limit)

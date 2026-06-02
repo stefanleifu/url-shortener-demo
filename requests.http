@@ -1,0 +1,37 @@
+@baseUrl = http://127.0.0.1:8000
+
+### Health check
+GET {{baseUrl}}/healthz
+
+### Create a short URL
+POST {{baseUrl}}/urls
+Content-Type: application/json
+
+{
+  "url": "https://example.com/a/long/path"
+}
+
+### Create a short URL with a custom alias
+POST {{baseUrl}}/urls
+Content-Type: application/json
+
+{
+  "url": "https://example.com/docs",
+  "customAlias": "docs"
+}
+
+### Create an expiring short URL
+POST {{baseUrl}}/urls
+Content-Type: application/json
+
+{
+  "url": "https://example.com/temporary",
+  "customAlias": "temporary",
+  "ttlSeconds": 3600
+}
+
+### Inspect stats
+GET {{baseUrl}}/stats/docs
+
+### Redirect
+GET {{baseUrl}}/docs

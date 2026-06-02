@@ -91,6 +91,35 @@ class ApiTestCase(unittest.TestCase):
         self.assertIn("customAlias must be 3-32 chars: letters, numbers, underscore, or hyphen", errors)
         self.assertIn("ttlSeconds must be a positive integer", errors)
 
+    def test_create_endpoint_is_rate_limited(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temp_dir.cleanup()
+
+        self.temp_dir = tempfile.TemporaryDirectory()
+        database_path = Path(self.temp_dir.name) / "rate-limited-links.db"
+        handler = create_app(
+            database_path,
+            create_rate_limit_per_minute=2,
+            rate_limit_window_seconds=60,
+        )
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.port = self.server.server_address[1]
+
+        first_status, _, _ = self.request("POST", "/urls", {"url": "https://example.com/one"})
+        second_status, _, _ = self.request("POST", "/urls", {"url": "https://example.com/two"})
+        third_status, headers, raw_body = self.request("POST", "/urls", {"url": "https://example.com/three"})
+
+        self.assertEqual(first_status, 201)
+        self.assertEqual(second_status, 201)
+        self.assertEqual(third_status, 429)
+        self.assertEqual(headers["X-RateLimit-Limit"], "2")
+        self.assertEqual(headers["X-RateLimit-Remaining"], "0")
+        self.assertEqual(json.loads(raw_body)["error"], "Rate limit exceeded")
+
 
 class LinkStoreTestCase(unittest.TestCase):
     def test_store_persists_created_link(self) -> None:
